@@ -5,6 +5,8 @@ are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.
 
 from __future__ import annotations
 
+from gateway.platforms.typing_scope import set_typing_paused
+
 import logging
 from typing import TYPE_CHECKING
 import asyncio
@@ -2209,6 +2211,23 @@ class GatewayTurnMixin:
                     logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
+                # In the executor, never the gateway event loop; no enriched prompt/context.
+                try:
+                    from agent.jev_shadow import observe
+                    from gateway.run import _get_channel_override
+                    shadow_key = self._resolve_session_key_or_none(source, None)
+                    shadow_state = self._peek_session_state(shadow_key) if shadow_key else None
+                    shadow_channel = _get_channel_override(
+                        self.config, source.platform, str(source.chat_id or ""),
+                        thread_id=str(source.thread_id) if source.thread_id else None,
+                        parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
+                    )
+                    observe(prompt, kind="background", actual_model=turn_route["model"],
+                            actual_provider=turn_route["runtime"].get("provider"),
+                            locked=bool((shadow_state and shadow_state.conversation.model_override)
+                                        or (shadow_channel and (shadow_channel.model or shadow_channel.provider))))
+                except Exception:
+                    pass  # Shadow failures must never abort the real task.
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -2426,7 +2445,7 @@ class GatewayTurnMixin:
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
             def _pause_typing_before_finalize(_adapter=adapter, _chat_id=source.chat_id) -> None:
-                _adapter.pause_typing_for_chat(_chat_id)
+                set_typing_paused(_adapter, _chat_id, paused=True, metadata={"thread_id": source.thread_id})
         # Non-editing platforms (QQ, WeChat) skip streaming — the partial first message could never
         # be updated — unless they have a native-streaming transport (WeCom msgtype "stream").
         _adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
@@ -3593,6 +3612,7 @@ class GatewayTurnMixin:
         # Restart the typing indicator; the outer typing task may be stale.
         if _clear_adapter:
             with suppress(Exception):
+                set_typing_paused(_clear_adapter, source.chat_id, paused=False, metadata=_status_thread_metadata)
                 await _clear_adapter.send_typing(source.chat_id, metadata=_status_thread_metadata)
 
         # Re-baseline the cached agent's message_count before recursing, else the coherence guard

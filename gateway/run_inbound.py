@@ -7,6 +7,8 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 
 from __future__ import annotations
 
+from gateway.platforms.typing_scope import set_typing_paused
+
 import logging
 from typing import TYPE_CHECKING
 import asyncio
@@ -355,7 +357,7 @@ class GatewayInboundMixin:
             _clarify_adapter = self._adapter_for_source(source)
             if _clarify_adapter:
                 try:
-                    _clarify_adapter.resume_typing_for_chat(source.chat_id)
+                    set_typing_paused(_clarify_adapter, source.chat_id, paused=False, metadata={"thread_id": source.thread_id})
                 except Exception:
                     logger.debug("Failed to resume typing after clarify response", exc_info=True)
             return ""

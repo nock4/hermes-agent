@@ -473,6 +473,16 @@ def delegate_task(
     if err:
         return tool_error(err)
 
+    # Shadow-only observer receives no context, credentials, or mutable runtime object.
+    try:
+        from agent.jev_shadow import observe
+        for task in task_list:
+            observe(task.get("goal", ""), kind="delegate", actual_model=creds.get("model"),
+                    actual_provider=creds.get("provider"),
+                    locked=bool(routing_cfg.get("model") or routing_cfg.get("provider") or routing_cfg.get("command")))
+    except Exception:
+        pass  # Sidecar availability must never affect dispatch.
+
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
