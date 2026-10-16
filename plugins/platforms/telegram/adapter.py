@@ -3585,7 +3585,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         long-polls live on until they rotted into CLOSE-WAIT while the adapter still reported connected
         (#111727). ``_keep_typing`` already refreshes every 2s, so one in-flight re-arm per chat, at most
         one per ``typing_retrigger_min_interval_seconds``, covers the gap a landed message leaves."""
+        self._topic_activity_state().forget(chat_id, metadata)
         if (metadata or {}).get("notify") or not getattr(getattr(self, "config", None), "typing_indicator", True):
+
             return
         # __dict__.setdefault: tests build adapters via object.__new__() (no __init__).
         tasks: dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_typing_retrigger_tasks", {})
@@ -4070,6 +4072,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         return (chat_type or "").lower() in {"dm", "private"}
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        return await self._topic_activity_state().stream(self, chat_id, draft_id, content, metadata)
+
+    async def _send_draft_frame(self, chat_id: str, draft_id: int, content: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
+
         """Stream a partial message via ``sendRichMessageDraft`` (when rich is enabled and supported) else
         ``sendMessageDraft``; reusing ``draft_id`` animates the preview. The caller sends the final text."""
         if not self._bot:
@@ -4757,7 +4763,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         await self._edit_md_quiet(query, edit_text)
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
-            self.resume_typing_for_chat(str(cb["chat_id"]))
+            self.resume_typing_for_chat(str(cb["chat_id"]), metadata={"thread_id": cb.get("thread_id")})
 
     async def _handle_slash_confirm_callback(self, query, data: str, cb: dict[str, Any]) -> None:
         """``sc:<choice>:<confirm_id>`` — resolve a slash-command confirmation."""
@@ -5557,7 +5563,33 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         slot_until[str(normalize_telegram_chat_id(chat_id))] = (
             asyncio.get_running_loop().time() + max(0.0, budget))
 
+    def _topic_activity_state(self):
+        # Lazy for hot-reloaded adapters and test instances built without __init__.
+        from plugins.platforms.telegram.topic_activity import TopicActivity
+        if not hasattr(self, "_telegram_topic_activity"):
+            self._telegram_topic_activity = TopicActivity()
+        return self._telegram_topic_activity
+
+    async def stop_typing(self, chat_id: str, metadata=None) -> None:
+        # No Telegram API cancels a draft: a final message clears it, otherwise it
+        # expires. Forget its text so future work never revives a previous answer.
+        self._topic_activity_state().forget(chat_id, metadata)
+
+    def pause_typing_for_chat(self, chat_id: str, metadata=None) -> None:
+        super().pause_typing_for_chat(chat_id, metadata)
+        self._topic_activity_state().forget(chat_id, metadata)
+
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
+        # Share the existing task lifecycle, including non-streaming/background work.
+        # Run both transports together so a native-action timeout cannot starve drafts.
+        await asyncio.gather(
+            self._send_native_typing(chat_id, metadata),
+            self._topic_activity_state().refresh(self, chat_id, metadata),
+            return_exceptions=True,
+        )
+
+    async def _send_native_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
+
         """Send typing indicator."""
         if not self._bot or self._typing_in_cooldown(chat_id):
             return
