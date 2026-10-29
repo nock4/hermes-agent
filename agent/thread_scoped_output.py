@@ -15,7 +15,7 @@ import sys
 import threading
 from typing import Iterator, TextIO
 
-__all__ = ["thread_scoped_silence"]
+__all__ = ["iter_stream_layers", "thread_scoped_silence"]
 
 _install_lock = threading.Lock()
 # Proxy installed per attribute ("stdout"/"stderr"): never double-wrap.
@@ -33,6 +33,26 @@ class _RoutingState:
         self.sink = sink
         self.silenced: dict[int, int] = {}
         self.lock = threading.Lock()
+
+
+def iter_stream_layers(stream):  # type: ignore[no-untyped-def]
+    """Yield ``stream`` and each wrapper layer beneath it.
+
+    Uses ``object.__getattribute__`` so a wrapper's delegating ``__getattr__`` is never
+    invoked: walking the chain must not itself recurse through it. Cycle-safe.
+    """
+    seen: set[int] = set()
+    while stream is not None and id(stream) not in seen:
+        seen.add(id(stream))
+        yield stream
+        nxt = None
+        for attr in ("_inner", "_passthrough"):
+            try:
+                nxt = object.__getattribute__(stream, attr)
+            except AttributeError:
+                continue
+            break
+        stream = nxt
 
 
 class _ThreadRoutingStream:
@@ -92,12 +112,17 @@ def _ensure_installed(attr: str, passthrough: TextIO) -> _ThreadRoutingStream:
     with _install_lock:
         proxy = _installed.get(attr)
         current = getattr(sys, attr, None)
-        if isinstance(current, _ThreadRoutingStream):
+        # Look THROUGH wrapper layers (e.g. process_bootstrap's _SafeWriter): a proxy
+        # hidden under one still counts as installed. Only matching the outermost object
+        # let each pass add a layer, and attribute misses then walked the whole chain
+        # until they exhausted the recursion limit.
+        existing = next((s for s in iter_stream_layers(current) if isinstance(s, _ThreadRoutingStream)), None)
+        if existing is not None:
             # A redirect context may restore an older proxy; adopt it rather
             # than wrapping it into an unbounded chain.
-            _installed[attr] = current
-            _routing_states[attr] = current._state
-            return current
+            _installed[attr] = existing
+            _routing_states[attr] = existing._state
+            return existing
         if proxy is not None and current is proxy:
             return proxy
         # Route non-silenced threads to whatever is currently bound (an active

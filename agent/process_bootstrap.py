@@ -332,9 +332,14 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
 
 def _install_safe_stdio() -> None:
     """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
+    from agent.thread_scoped_output import iter_stream_layers
+
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
-        if stream is not None and not isinstance(stream, _SafeWriter):
+        # Check every layer, not just the outermost: a thread-routing proxy installed on
+        # top of an existing _SafeWriter would otherwise get wrapped again on each agent
+        # build, growing the delegation chain until attribute lookup hit RecursionError.
+        if stream is not None and not any(isinstance(s, _SafeWriter) for s in iter_stream_layers(stream)):
             setattr(sys, stream_name, _SafeWriter(stream))
 
 
