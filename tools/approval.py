@@ -130,10 +130,18 @@ def register_gateway_notify(session_key: str, cb) -> None:
         _gateway_notify_cbs[session_key] = cb
 
 
-def unregister_gateway_notify(session_key: str) -> None:
+def unregister_gateway_notify(session_key: str, cb=None) -> None:
     """Unregister the callback and wake ALL blocked threads for this session so
-    they don't hang forever (agent run finished or interrupted)."""
+    they don't hang forever (agent run finished or interrupted).
+
+    With ``cb``, only unregister when ``cb`` is still the registered notifier: an
+    older run on the same session key ending after a newer run registered must not
+    strip the newer run's route (its approvals would silently miss the platform)
+    or wake the newer run's pending approval waiters."""
     with _lock:
+        if cb is not None and _gateway_notify_cbs.get(session_key) is not cb:
+            logger.info("approval notifier for %s belongs to a newer run; leaving it registered", session_key)
+            return
         _gateway_notify_cbs.pop(session_key, None)
         for entry in _gateway_queues.pop(session_key, []):
             entry.event.set()
@@ -846,6 +854,15 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 _record_denial(session_key)
                 return deny(spec.transport_denied, "denied")
             return grant(choice)
+
+    # Routing diagnostics (no command text or credentials): which surface a human decision will use and why.
+    _route_cb = _gateway_notify_cb(session_key) if (is_gateway or is_ask) else None
+    logger.info(
+        "approval route: noun=%s session_key=%s platform=%s is_cli=%s is_gateway=%s is_ask=%s "
+        "notifier=%s cli_callback=%s thread=%s",
+        spec.noun, session_key, _get_session_platform() or "-", is_cli, is_gateway, is_ask,
+        _route_cb is not None, approval_callback is not None, threading.current_thread().name,
+    )
 
     # Gateway/async approval: block the agent thread until /approve or /deny, mirroring the CLI's synchronous input()
     # flow. The agent never sees "approval_required" here — it gets output or a definitive BLOCKED.

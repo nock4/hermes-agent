@@ -891,11 +891,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         approval blocks the agent thread (mirrors CLI input()); the callback bridges sync→async."""
         from gateway.run import _wrap_current_message_with_observed_context
         from tools.approval import register_gateway_notify, unregister_gateway_notify
-        from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.approval_context import (reset_current_session_key, reset_hermes_interactive_context,
+                                            set_current_session_key, set_hermes_interactive_context)
         ctx = self._ctx
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
-        register_gateway_notify(session_key, self._approval_notify_sync)
+        # A platform turn is never an interactive CLI, even when a desktop/TUI session in this
+        # shared process set HERMES_INTERACTIVE=1 process-wide: without this, a missing notifier
+        # routes the approval to an invisible local prompt instead of the platform's /approve queue.
+        interactive_token = set_hermes_interactive_context(False)
+        notify_cb = self._approval_notify_sync  # bound once: unregister compares identity
+        register_gateway_notify(session_key, notify_cb)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
@@ -944,7 +950,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 _settle_api_runtime_lock(agent, result, captured)
             return result
         finally:
-            unregister_gateway_notify(session_key)
+            unregister_gateway_notify(session_key, notify_cb)
+            reset_hermes_interactive_context(interactive_token)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.
             with suppress(Exception):
