@@ -5,6 +5,7 @@ vendor label so emitted text matches the pre-refactor per-vendor modules."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from typing import Any, Dict, List, Optional
@@ -74,7 +75,11 @@ class CloudBrowserProvider(BrowserProvider):
 
     @staticmethod
     def _session_name(task_id: str) -> str:
-        return f"hermes_{task_id}_{uuid.uuid4().hex[:8]}"
+        # Also the local agent-browser session: it names the socket dir AND the socket file
+        # (``/tmp/agent-browser-<name>/<name>.sock``), so its length counts twice against the
+        # macOS 103-byte AF_UNIX limit. Gateway task ids are ~25 chars, so hash, don't embed.
+        task_tag = hashlib.sha1(str(task_id).encode()).hexdigest()[:6]
+        return f"hermes_{task_tag}_{uuid.uuid4().hex[:8]}"
 
     def _post_create(
         self, url: str, headers: dict[str, str], payload: dict[str, object], *, wrap_errors: bool = True
