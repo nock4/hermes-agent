@@ -6029,13 +6029,13 @@ def _get_cached_client(
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            loop_ok = not async_mode or (
+            # Unwrapped clients (DirectSDK, ACP) own no loop; evicting close()s them and cancels a sibling's call.
+            loop_ok = not async_mode or getattr(type(cached_client), "HERMES_SKIP_ASYNC_WRAP", False) is True or (
                 cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
             )
             if loop_ok:
                 return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
+            # Stale async entry — evict. Only a closed owner loop may be awaited; a live foreign loop is neutered.
             _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
             del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
