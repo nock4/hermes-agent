@@ -624,6 +624,10 @@ class BaseEnvironment(ABC):
         result["output"] = cleaned
 
     # --- Hooks ---
+    def _recover_cwd(self) -> None:
+        """Swap ``self.cwd`` for a usable directory if it vanished. Local backends
+        override this; remote backends keep their cwd as-is."""
+
     def _before_execute(self) -> None:
         """Hook before each command. Remote backends (SSH, Modal, Daytona)
         trigger their FileSyncManager here; bind-mount backends and Local don't."""
@@ -668,6 +672,15 @@ class BaseEnvironment(ABC):
             from tools.terminal_tool_sudo import _rewrite_compound_background
             exec_command = _rewrite_compound_background(exec_command)
         effective_timeout = timeout or self.timeout
+        # The session cwd may have been deleted since the last command (a prior
+        # ``rm -rf`` of its own dir). Recover BEFORE the ``cd <cwd>`` wrapper is
+        # built, or the script cds into the dead path and exits 126 even though
+        # Popen's cwd was healed. File ops pass the live ``self.cwd`` explicitly,
+        # so treat that the same as "no cwd given"; another explicit cwd is left
+        # alone so a genuinely wrong path still reports its own error.
+        if not cwd or cwd == self.cwd:
+            self._recover_cwd()
+            cwd = ""
         effective_cwd = cwd or self.cwd
 
         # Merge sudo stdin with caller stdin.

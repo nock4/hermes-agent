@@ -8,6 +8,7 @@ import os
 import posixpath
 import re
 import shlex
+import contextlib
 import subprocess
 import sys
 import threading
@@ -364,6 +365,11 @@ class SearchMixin:
         search (diagnostics feed the error message), discarded (``2>/dev/null``) for
         file lists and probes."""
         from tools.environments.local import _kill_process_group_posix, _make_run_env
+        # A deleted session cwd would make Popen raise ENOENT on every search; heal
+        # it the same way the shell lane does before the wrapper is built.
+        recover = getattr(self.env, "_recover_cwd", None)
+        if callable(recover):
+            recover()
         cwd = getattr(self.env, "cwd", None) or self.cwd
         args = shlex.split(" ".join(argv))
         try:
@@ -401,7 +407,13 @@ class SearchMixin:
                 exit_code = 124
                 break
         if proc.poll() is None:
-            _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
+            # rg closes stdout as it exits, so the drainer can finish while rg is
+            # mid-exit: poll() still says running but getpgid() already reports
+            # ESRCH (macOS does this for exiting/zombie processes). Nothing is left
+            # to kill then; wait() below reaps it. Without this, single-file
+            # searches under load failed with "[Errno 3] No such process".
+            with contextlib.suppress(ProcessLookupError):
+                _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
         proc.wait()
         drainer.join()
         proc.stdout.close()

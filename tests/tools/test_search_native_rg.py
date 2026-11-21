@@ -7,6 +7,7 @@ shared, so the two transports must agree on results.
 """
 
 import json
+import os
 
 import pytest
 
@@ -140,3 +141,62 @@ def test_local_search_runs_the_pinned_ripgrep_not_the_first_on_path(_local_env, 
                         lambda name: InstalledPackage(pinned.parent, "15", pinned) if name == "ripgrep" else None)
     ops = ShellFileOperations(_local_env, cwd=str(tmp_path))
     assert ops._resolve_command("rg") == str(pinned).replace("\\", "/")
+
+
+def test_rg_exiting_between_poll_and_group_kill_is_not_a_tool_error(tree, ops_factory, monkeypatch):
+    """rg closes stdout as it exits, so the drainer can finish while rg is mid-exit:
+    ``poll()`` still reports it running, but ``getpgid`` already answers ESRCH (macOS does
+    this for exiting/zombie processes). Under load this made single-file searches fail with
+    ``[Errno 3] No such process`` almost every time; the search must still succeed."""
+    import subprocess
+
+    from tools.environments import local
+
+    monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "1")
+    ops = ops_factory(tree, [])
+    real_poll = subprocess.Popen.poll
+    polls = {"n": 0}
+
+    def poll_reports_running_once(self):
+        # Only rg's own process: the shell lane's ``command -v rg`` probe polls too.
+        if "rg" in str(self.args) and "command -v" not in str(self.args):
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return None
+        return real_poll(self)
+
+    def group_already_gone(proc):
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(subprocess.Popen, "poll", poll_reports_running_once)
+    monkeypatch.setattr(local, "_kill_process_group_posix", group_already_gone)
+    result = ops.search(pattern="needle", path=str(tree / "a.py"))
+    assert not result.error, result.to_dict()
+    assert polls["n"] >= 1
+    assert result.total_count == 2, result.to_dict()
+
+
+def test_search_and_terminal_survive_a_deleted_session_cwd(tree, ops_factory, _local_env, tmp_path, monkeypatch):
+    """A prior command ``rm -rf``'d the session cwd. The native rg lane used to Popen with
+    the dead cwd (ENOENT on every search), and the shell wrapper still ``cd``'d into it
+    (exit 126 on every command) because the cwd was healed only after the wrapper was
+    built. Both must fall back to a surviving parent and keep working."""
+    import shutil
+
+    monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "1")
+    ops = ops_factory(tree, [])
+    # Warm the ``command -v rg`` cache first: that probe runs through the shell lane,
+    # which would heal the cwd before the native lane ever saw it.
+    assert not ops.search(pattern="needle", path=str(tree / "a.py")).error
+    doomed = tmp_path / "doomed"
+    doomed.mkdir()
+    _local_env.cwd = str(doomed)
+    shutil.rmtree(doomed)
+
+    result = ops.search(pattern="needle", path=str(tree / "a.py"))
+    assert not result.error and result.total_count == 2, result.to_dict()
+
+    _local_env.cwd = str(doomed)  # dead again; this time the shell lane goes first
+    out = type(_local_env).execute(_local_env, "echo alive")
+    assert out["returncode"] == 0 and "alive" in out["output"], out
+    assert os.path.isdir(_local_env.cwd)
